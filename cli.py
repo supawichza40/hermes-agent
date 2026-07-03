@@ -11073,9 +11073,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self._voice_continuous = False
                     self._no_speech_count = 0
                     _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
+                    self._voice_end_wake_turn()
                     return
             else:
                 self._no_speech_count = 0
+                if not self._voice_tts and not self._voice_continuous:
+                    # Transcript submitted, but TTS is off (so
+                    # _voice_speak_response's finally-block rearm below will
+                    # never run) and continuous mode already ended (manual
+                    # push-to-talk stop) -- return to wake idle now instead
+                    # of waiting for a TTS callback that won't fire.
+                    self._voice_end_wake_turn()
 
             # If no transcript was submitted but continuous mode is active,
             # restart recording so the user can keep talking.
@@ -11153,7 +11161,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"{_DIM}TTS playback failed: {e}{_RST}")
         finally:
             self._voice_tts_done.set()
-
+            # If continuous mode has already ended (no-speech timeout or a
+            # manual push-to-talk stop), this spoken reply was the last one
+            # of the hands-free session -- return to wake-word idle.
+            if not self._voice_continuous:
+                self._voice_end_wake_turn()
 
     def _voice_beeps_enabled(self) -> bool:
         """Return whether CLI voice mode should play record start/stop beeps."""
@@ -11226,6 +11238,76 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         _cprint(f"  {_DIM}/voice tts  to toggle speech output{_RST}")
         _cprint(f"  {_DIM}/voice off  to disable voice mode{_RST}")
 
+        # Wake-word front-gate (Wave-2): feature-gated on voice.wake_word.
+        # start_wake_word() is a no-op returning False when unset/malformed
+        # or when openwakeword/the model fails to load, so an unconfigured
+        # or broken wake word leaves voice mode exactly push-to-talk, per
+        # the design spec's fallback requirement.
+        try:
+            from hermes_cli.voice import start_wake_word
+            if start_wake_word(self._voice_on_wake_detected):
+                _cprint(f"  {_DIM}Say \"Hey Jarvis\" to start talking hands-free{_RST}")
+        except Exception as e:
+            logger.warning("wake word arm failed: %s", e)
+
+    def _voice_on_wake_detected(self):
+        """Callback fired by the wake-word listener on a "Hey Jarvis" hit.
+
+        Runs on the wake listener's own thread (already stopped/released by
+        the time this fires -- see hermes_cli.voice.start_wake_word) so it
+        just kicks off the same capture path as pressing the push-to-talk
+        key, on a fresh daemon thread.
+        """
+        with self._voice_lock:
+            self._voice_continuous = True
+
+        def _start_recording():
+            try:
+                self._voice_start_recording()
+                if hasattr(self, '_app') and self._app:
+                    self._app.invalidate()
+            except Exception as e:
+                _cprint(f"\n{_DIM}Voice recording failed: {e}{_RST}")
+        threading.Thread(target=_start_recording, daemon=True).start()
+
+    def _voice_end_wake_turn(self):
+        """Return to wake-word idle listening once a hands-free turn ends.
+
+        No-op when voice.wake_word isn't configured (the feature gate lives
+        in rearm_wake_word_after_turn / wake_word_config). When it IS
+        configured, also releases the persistent push-to-talk recorder's
+        mic stream so the wake listener -- which is about to open its own
+        stream -- is the sole mic owner while idle; AudioRecorder otherwise
+        keeps its InputStream open indefinitely between recordings.
+        """
+        try:
+            from hermes_cli.voice import rearm_wake_word_after_turn, wake_word_config
+            from hermes_cli.config import load_config
+            wake_word, _ = wake_word_config(load_config())
+        except Exception:
+            wake_word = None
+
+        if not wake_word:
+            return  # feature gate off -- unchanged behavior
+
+        recorder = None
+        with self._voice_lock:
+            recorder = self._voice_recorder
+            self._voice_recorder = None
+
+        # Shut the old recorder stream down synchronously *before* rearming
+        # the wake listener: rearm_wake_word_after_turn() opens a new mic
+        # InputStream, and the wake stream and the recorder stream must
+        # never be open at the same time. A backgrounded shutdown here
+        # would race the new wake stream's open, so this must finish first.
+        if recorder is not None:
+            try:
+                recorder.shutdown()
+            except Exception:
+                pass
+
+        rearm_wake_word_after_turn(self._voice_on_wake_detected)
+
     def _disable_voice_mode(self):
         """Disable voice mode, cancel any active recording, and stop TTS."""
         recorder = None
@@ -11247,6 +11329,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     pass
             threading.Thread(target=_bg_shutdown, daemon=True).start()
             self._voice_recorder = None
+
+        # Disarm the wake-word listener too (no-op if never armed) and reset
+        # the mic-ownership guard to IDLE. If voice mode is disabled mid-turn
+        # the guard is still ACTIVE; without the reset a later `/voice on`
+        # re-arms a listener whose detections are all ignored, silently
+        # bricking the wake word until the process restarts.
+        try:
+            from hermes_cli.voice import reset_wake_state, stop_wake_word
+            stop_wake_word()
+            reset_wake_state()
+        except Exception:
+            pass
 
         # Stop any active TTS playback
         try:
@@ -11982,10 +12076,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         _get_provider as _get_prov,
                         _import_elevenlabs,
                         _import_sounddevice,
+                        get_env_value as _tts_env,
                         stream_tts_to_speaker,
                     )
                     _tts_cfg = _load_tts_cfg()
-                    if _get_prov(_tts_cfg) == "elevenlabs":
+                    # Key check matters: without it streaming arms, then
+                    # disables itself at synth time (no key), and the batch
+                    # path below is skipped because use_streaming_tts is
+                    # already True -- net result silent replies. With the
+                    # key absent we leave streaming off so batch TTS runs
+                    # and degrades to Edge via tts_tool's fallback.
+                    if _get_prov(_tts_cfg) == "elevenlabs" and (_tts_env("ELEVENLABS_API_KEY") or ""):
                         # Verify both ElevenLabs SDK and audio output are available
                         _import_elevenlabs()
                         _import_sounddevice()
@@ -12322,6 +12423,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 if self._voice_continuous:
                     self._voice_continuous = False
                     _cprint(f"\n{_DIM}Continuous voice mode stopped due to error.{_RST}")
+                    if not self._voice_tts:
+                        # No TTS reply will be spoken for this error, so
+                        # _voice_speak_response's finally-block rearm never
+                        # fires and the continuous loop has just been killed.
+                        # Without this the mic state stays ACTIVE forever and
+                        # the wake word never re-arms. (When TTS is on, the
+                        # spoken error's finally-block handles the rearm.)
+                        self._voice_end_wake_turn()
 
             # Handle interrupt - check if we were interrupted
             pending_message = None

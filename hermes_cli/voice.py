@@ -302,6 +302,18 @@ _continuous_on_silent_limit: Optional[Callable[[], None]] = None
 _continuous_no_speech_count = 0
 _CONTINUOUS_NO_SPEECH_LIMIT = 3
 
+# ── Wake-word gate state ──────────────────────────────────────────────
+# Feature-gated: inert unless voice.wake_word is set in config (see
+# start_wake_word). _voice_state is the single guard that enforces
+# mic-exclusivity between the wake listener and Hermes' own capture --
+# "IDLE" means the wake listener may own the mic, "ACTIVE" means a
+# capture/transcribe/respond/speak turn is in flight and the wake
+# listener must not be running.
+_wake_listener: Any = None
+_wake_lock = threading.Lock()
+_voice_state = "IDLE"
+_voice_state_lock = threading.Lock()
+
 
 # ── Push-to-talk API ─────────────────────────────────────────────────
 
@@ -844,3 +856,187 @@ def speak_text(text: str) -> None:
                         logger.warning(
                             "failed to resume recorder after TTS: %s", e
                         )
+
+
+# ── Wake-word gate API ─────────────────────────────────────────────────
+#
+# Feature-gated on voice.wake_word: absence/empty means these functions
+# are all no-ops and behavior is exactly as it was before this module
+# existed (start_wake_word returns False without touching the mic).
+#
+# Mic-contention state machine (see design spec's "Mic-contention rule"):
+#   IDLE (wake listening) --detect--> stop_wake_word() --> ACTIVE
+#     (caller runs start_recording()/start_continuous(), transcribes,
+#      the agent responds, speak_text() plays the reply)
+#   ACTIVE --turn complete--> rearm_wake_word_after_turn() --> IDLE
+# _voice_state + _voice_state_lock is the single guard: _set_voice_state
+# only allows one thread to win each transition, so a stray/duplicate
+# wake detection or a duplicate rearm call is a safe no-op rather than
+# a second mic owner.
+
+
+def _set_voice_state(new_state: str) -> bool:
+    """Atomically transition the mic-ownership guard.
+
+    Returns False (no-op) if already in ``new_state`` -- callers use this
+    to make the IDLE<->ACTIVE transition idempotent under races (e.g. two
+    near-simultaneous wake detections, or a duplicate rearm call).
+    """
+    global _voice_state
+    with _voice_state_lock:
+        if _voice_state == new_state:
+            return False
+        _voice_state = new_state
+        return True
+
+
+def wake_word_config(cfg: Any) -> "tuple[Optional[str], float]":
+    """Shape-safe ``cfg.voice.wake_word`` / ``wake_threshold`` lookup.
+
+    Returns ``(None, 0.5)`` when unset, empty, or malformed -- this is
+    the feature gate: no configured wake word means wake-word mode is
+    off and every other function in this section stays inert.
+    """
+    voice_cfg = cfg.get("voice") if hasattr(cfg, "get") else None
+    if not isinstance(voice_cfg, dict):
+        return None, 0.5
+    wake_word = voice_cfg.get("wake_word")
+    if not isinstance(wake_word, str) or not wake_word.strip():
+        return None, 0.5
+    threshold = voice_cfg.get("wake_threshold", 0.5)
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        threshold = 0.5
+    return wake_word.strip(), float(threshold)
+
+
+def _resolve_wake_model_path(wake_word: str) -> Optional[str]:
+    """Locate the bundled openWakeWord ONNX model for ``wake_word``."""
+    try:
+        import openwakeword
+
+        models_dir = os.path.join(
+            os.path.dirname(openwakeword.__file__), "resources", "models"
+        )
+    except Exception:
+        return None
+    candidate = os.path.join(models_dir, f"{wake_word}_v0.1.onnx")
+    return candidate if os.path.isfile(candidate) else None
+
+
+def start_wake_word(on_wake: Callable[[], None]) -> bool:
+    """Arm the wake-word listener if ``voice.wake_word`` is configured.
+
+    Returns True once armed (or already armed). Returns False -- without
+    raising -- when the feature is unset, or when openwakeword/the model
+    fails to load; callers must treat False as "stay on push-to-talk",
+    per the design spec's fallback requirement.
+    """
+    global _wake_listener
+
+    try:
+        from hermes_cli.config import load_config
+
+        wake_word, threshold = wake_word_config(load_config())
+    except Exception as e:
+        _debug(f"start_wake_word: config lookup failed: {e}")
+        return False
+
+    if not wake_word:
+        return False  # feature gate: unset = off, exactly as before
+
+    with _wake_lock:
+        if _wake_listener is not None and _wake_listener.is_running():
+            return True  # already armed
+
+        model_path = _resolve_wake_model_path(wake_word)
+        if not model_path:
+            logger.warning(
+                "voice.wake_word=%r has no bundled ONNX model -- "
+                "falling back to push-to-talk",
+                wake_word,
+            )
+            return False
+
+        def _on_detect() -> None:
+            if not _set_voice_state("ACTIVE"):
+                _debug("wake word fired while already ACTIVE -- ignored")
+                return
+            _debug("wake word detected -- releasing wake listener, arming capture")
+            stop_wake_word()
+            _play_beep(frequency=880, count=1)
+            try:
+                on_wake()
+            except Exception as e:
+                logger.error("on_wake callback failed: %s", e, exc_info=True)
+
+        try:
+            from hermes_cli.wakeword import WakeWordListener
+
+            listener = WakeWordListener(
+                model_path=model_path, threshold=threshold, on_detect=_on_detect
+            )
+            listener.start()
+        except Exception as e:
+            logger.warning(
+                "Wake word listener failed to start (%s) -- "
+                "falling back to push-to-talk",
+                e,
+            )
+            _debug(f"start_wake_word raised {type(e).__name__}: {e}")
+            return False
+
+        _wake_listener = listener
+        _debug(f"start_wake_word: armed on {model_path!r} (threshold={threshold})")
+        return True
+
+
+def stop_wake_word() -> None:
+    """Disarm the wake-word listener and release its mic stream.
+
+    Safe to call when not armed (no-op).
+    """
+    global _wake_listener
+    with _wake_lock:
+        listener = _wake_listener
+        _wake_listener = None
+    if listener is not None:
+        try:
+            listener.stop()
+        except Exception as e:
+            logger.warning("wake listener stop failed: %s", e)
+
+
+def is_wake_word_active() -> bool:
+    """True if the wake-word listener is currently armed and polling."""
+    with _wake_lock:
+        listener = _wake_listener
+    return listener is not None and listener.is_running()
+
+
+def reset_wake_state() -> None:
+    """Force the mic-ownership guard back to IDLE.
+
+    Used when voice mode is torn down (``/voice off``): if the user disables
+    voice mid-turn the guard is still ACTIVE, and without this reset a later
+    ``/voice on`` re-arms a listener whose detections are all no-ops -- the
+    ``_on_detect`` ``_set_voice_state("ACTIVE")`` returns False because the
+    guard never left ACTIVE -- permanently bricking the wake word until the
+    process restarts. Not called from the detection path; those transitions
+    are owned by ``_on_detect`` / ``rearm_wake_word_after_turn``.
+    """
+    global _voice_state
+    with _voice_state_lock:
+        _voice_state = "IDLE"
+
+
+def rearm_wake_word_after_turn(on_wake: Callable[[], None]) -> bool:
+    """Return to wake-word IDLE once a capture turn is fully finished.
+
+    Call this after the transcribe -> agent -> speak_text turn completes
+    (or is abandoned, e.g. 3x no-speech). No-op (returns False) if
+    already IDLE or if voice.wake_word isn't configured, so it is safe
+    to call unconditionally from turn-completion sites.
+    """
+    if not _set_voice_state("IDLE"):
+        return False
+    return start_wake_word(on_wake)

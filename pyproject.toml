@@ -176,6 +176,8 @@ voice = [
   "faster-whisper==1.2.1",
   "sounddevice==0.5.5",
   "numpy==2.4.3",
+  # "Hey Jarvis" wake word (on-device, ONNX runtime on macOS/Windows).
+  "openwakeword==0.6.0",
 ]
 pty = [
   # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
