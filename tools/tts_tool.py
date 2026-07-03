@@ -2157,6 +2157,15 @@ def text_to_speech_tool(
     tts_config = _load_tts_config()
     provider = _get_provider(tts_config)
 
+    # ElevenLabs without an API key degrades to free Edge TTS instead of
+    # erroring into silence, so voice replies keep working when the key is
+    # removed (config keeps ``tts.provider: elevenlabs`` as the preference).
+    if provider == "elevenlabs" and not (get_env_value("ELEVENLABS_API_KEY") or ""):
+        logger.warning(
+            "ELEVENLABS_API_KEY not set; falling back to Edge TTS (free)"
+        )
+        provider = "edge"
+
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
     # so a user's ``tts.providers.openai.command`` can't override the real
